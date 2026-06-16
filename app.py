@@ -76,15 +76,26 @@ with st.sidebar:
     f_tms = st.file_uploader("TMS (ZIP o CSV)", type=["zip", "csv"], key="tms")
 
     st.header("2. Ventana de análisis")
-    now = datetime.now()
-    default_desde = now - timedelta(hours=14)
+    # FIX: guardamos los valores iniciales en session_state UNA sola vez.
+    # Antes, "now = datetime.now()" se recalculaba en cada interacción del
+    # usuario (Streamlit re-ejecuta todo el script en cada click/tecla), y
+    # como el widget no tenía key, Streamlit lo reseteaba a esa nueva hora
+    # "actual" en vez de respetar lo que el usuario ya había escrito.
+    if 'desde_date' not in st.session_state:
+        _now = datetime.now()
+        _default_desde = _now - timedelta(hours=14)
+        st.session_state.desde_date = _default_desde.date()
+        st.session_state.desde_time = _default_desde.time()
+        st.session_state.hasta_date = _now.date()
+        st.session_state.hasta_time = _now.time()
+
     c1, c2 = st.columns(2)
     with c1:
-        desde_date = st.date_input("Desde — fecha", value=default_desde.date())
-        desde_time = st.time_input("Desde — hora", value=default_desde.time())
+        desde_date = st.date_input("Desde — fecha", key="desde_date")
+        desde_time = st.time_input("Desde — hora", key="desde_time")
     with c2:
-        hasta_date = st.date_input("Hasta — fecha", value=now.date())
-        hasta_time = st.time_input("Hasta — hora", value=now.time())
+        hasta_date = st.date_input("Hasta — fecha", key="hasta_date")
+        hasta_time = st.time_input("Hasta — hora", key="hasta_time")
 
     desde = pd.Timestamp(datetime.combine(desde_date, desde_time))
     hasta = pd.Timestamp(datetime.combine(hasta_date, hasta_time))
