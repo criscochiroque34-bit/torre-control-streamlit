@@ -1,7 +1,7 @@
 """
-Torre de Control · Despacho Nocturno — versión Streamlit
-Misma lógica de la versión web, pero con pandas para procesar
-archivos pesados (TMS de millones de filas) en segundos.
+Torre de Control · Despacho Nocturno — interfaz Streamlit (v4)
+Procesa archivos pesados con pandas (TMS de millones de filas en segundos).
+Toda la lógica de negocio vive en engine.py.
 """
 import streamlit as st
 import pandas as pd
@@ -15,40 +15,33 @@ from engine import (
 
 st.set_page_config(page_title="Torre de Control · Despacho", layout="wide", page_icon="📦")
 
-# ---------------------------------------------------------------------------
-# Estilos
-# ---------------------------------------------------------------------------
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;white-space:nowrap}
-.b-ok{background:#0f2417;color:#2ea043;border:1px solid #1a4a25}
+.b-ok{background:#0d2818;color:#2ea043;border:1px solid #1a4a25}
 .b-warn{background:#241c08;color:#d29922;border:1px solid #4a3a0a}
 .b-alert{background:#2a0f0f;color:#f85149;border:1px solid #4a1515}
 .b-orange{background:#251608;color:#e8892b;border:1px solid #4a2a08}
 .b-priority{background:#1a0a2a;color:#c084fc;border:1px solid #6b3fa0}
-.b-gray{background:#1a2130;color:#8b98a5;border:1px solid #27313d}
-.pipe{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0}
-.pipe-box{background:#1c2530;border:1px solid #27313d;border-radius:6px;padding:6px 12px;text-align:center;min-width:90px}
-.pipe-box .v{font-weight:700;font-size:16px}
-.pipe-box .l{font-size:10px;color:#8b98a5;text-transform:uppercase;letter-spacing:.04em}
-.pipe-box .s{font-size:10px}
-.pipe-arrow{color:#27313d;font-size:18px}
+.b-gray{background:#1a2130;color:#8b98a5;border:1px solid #283041}
+.b-cyan{background:#08222a;color:#3fb6d3;border:1px solid #1d5566}
+.funnel{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0}
+.fstep{flex:1;min-width:120px;background:#1c2230;border:1px solid #283041;border-radius:9px;padding:10px 13px}
+.fstep .l{font-size:11px;color:#8b98a5;text-transform:uppercase;letter-spacing:.04em}
+.fstep .v{font-size:21px;font-weight:700;margin-top:2px}
+.fstep .p{font-size:12px;color:#8b98a5}
+.fstep.s1 .v{color:#e6edf3}.fstep.s2 .v{color:#4d9fff}.fstep.s3 .v{color:#5dcaa5}.fstep.s4 .v{color:#2ea043}
+.salida-ok{display:inline-block;font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;background:#0d2818;color:#2ea043;border:1px solid #1a4a25}
+.salida-no{display:inline-block;font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;background:#241c08;color:#d29922;border:1px solid #4a3a0a}
 </style>
 """, unsafe_allow_html=True)
 
 
-def badge(label, cat):
-    cls = {'ok': 'b-ok', 'warn': 'b-warn', 'alert': 'b-alert',
-           'orange': 'b-orange', 'priority': 'b-priority'}.get(cat, 'b-gray')
-    return f'<span class="badge {cls}">{label}</span>'
-
-
-def tms_badge(row):
-    if row['tms_cat'] is None or pd.isna(row['tms_cat']):
-        return badge('Sin registro', 'gray')
-    return badge(row['tms_label'], row['tms_cat'] if row['tms_cat'] in
-                  ('ok', 'warn', 'alert', 'orange', 'priority') else
-                  {'dispatched': 'ok', 'pending': 'warn', 'review': 'orange', 'quarantine': 'priority'}[row['tms_cat']])
+def tms_label_or_none(row):
+    lbl = row.get('tms_label')
+    if lbl is None or (isinstance(lbl, float) and pd.isna(lbl)):
+        return 'Sin registro TMS'
+    return lbl
 
 
 def anc_text(row, is_van):
@@ -57,17 +50,20 @@ def anc_text(row, is_van):
     return f"{int(row['anc_count'])}/{int(row['bultos'])}"
 
 
-# ---------------------------------------------------------------------------
-# Estado de sesión
-# ---------------------------------------------------------------------------
+def ruta_display(row):
+    r = row.get('ruta', '')
+    if r is None or (isinstance(r, float) and pd.isna(r)) or str(r) == '':
+        r = '—'
+    if row.get('ruta_alerta'):
+        return f"{r} \u26a0"
+    return str(r)
+
+
 if 'result' not in st.session_state:
     st.session_state.result = None
 
 st.title("📦 Torre de Control · Despacho Nocturno")
 
-# ---------------------------------------------------------------------------
-# Sidebar — carga de archivos + ventana
-# ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("1. Archivos")
     f_zeus = st.file_uploader("Zeus (Excel)", type=["xlsx", "xls"], key="zeus")
@@ -76,16 +72,11 @@ with st.sidebar:
     f_tms = st.file_uploader("TMS (ZIP o CSV)", type=["zip", "csv"], key="tms")
 
     st.header("2. Ventana de análisis")
-    # FIX: guardamos los valores iniciales en session_state UNA sola vez.
-    # Antes, "now = datetime.now()" se recalculaba en cada interacción del
-    # usuario (Streamlit re-ejecuta todo el script en cada click/tecla), y
-    # como el widget no tenía key, Streamlit lo reseteaba a esa nueva hora
-    # "actual" en vez de respetar lo que el usuario ya había escrito.
     if 'desde_date' not in st.session_state:
         _now = datetime.now()
-        _default_desde = _now - timedelta(hours=14)
-        st.session_state.desde_date = _default_desde.date()
-        st.session_state.desde_time = _default_desde.time()
+        _d = _now - timedelta(hours=14)
+        st.session_state.desde_date = _d.date()
+        st.session_state.desde_time = _d.time()
         st.session_state.hasta_date = _now.date()
         st.session_state.hasta_time = _now.time()
 
@@ -106,9 +97,6 @@ with st.sidebar:
         st.session_state.result = None
         st.rerun()
 
-# ---------------------------------------------------------------------------
-# Procesamiento
-# ---------------------------------------------------------------------------
 if procesar:
     if not f_zeus:
         st.error("Falta cargar el archivo Zeus.")
@@ -125,7 +113,6 @@ if procesar:
                 if f_tms:
                     tms_df, tms_total = read_tms(f_tms, f_tms.name)
 
-                # columnas mínimas si vienen vacíos (evitar errores de indexado)
                 if etiq_df.empty:
                     etiq_df = pd.DataFrame(columns=range(5))
                 if anc_df.empty:
@@ -135,14 +122,11 @@ if procesar:
                 result['tms_total_raw'] = tms_total
                 result['win'] = (desde, hasta)
                 st.session_state.result = result
-                st.success(f"Listo · {len(result['pedidos'])} pedidos analizados"
-                            + (f" · TMS: {tms_total:,} filas → {len(tms_df)} códigos únicos" if f_tms else ""))
+                st.success(f"Listo · {len(result['pedidos'])} pedidos"
+                           + (f" · TMS: {tms_total:,} filas → {len(tms_df)} únicos" if f_tms else ""))
             except Exception as e:
                 st.error(f"Error al procesar: {e}")
 
-# ---------------------------------------------------------------------------
-# Resultados
-# ---------------------------------------------------------------------------
 result = st.session_state.result
 if result is None:
     st.info("Carga los archivos en la barra lateral, define la ventana y presiona **Procesar**.")
@@ -150,40 +134,108 @@ if result is None:
 
 pedidos = result['pedidos']
 sin_recep = result['sin_recepcion']
+funnel = result['funnel']
 desde, hasta = result['win']
 
-st.caption(f"Ventana: {desde.strftime('%d/%m %H:%M')} → {hasta.strftime('%d/%m %H:%M')}"
-           + (f"  ·  TMS: {result['tms_total_raw']:,} filas procesadas" if result['tms_total_raw'] else ""))
+st.caption(f"📅 Ventana: {desde.strftime('%d/%m %H:%M')} → {hasta.strftime('%d/%m %H:%M')}"
+           + (f"  ·  TMS: {result['tms_total_raw']:,} filas procesadas" if result.get('tms_total_raw') else ""))
 
-# ---------------------------------------------------------------------------
-# Filtro de flota
-# ---------------------------------------------------------------------------
+if pedidos.empty:
+    st.warning("No se encontraron pedidos de las flotas válidas en esta ventana. "
+               "Revisa la ventana de fechas o las columnas de los archivos.")
+    st.stop()
+
+# ---- EMBUDO GENERAL ----
+g = funnel['general']
+st.markdown("##### Avance general del despacho")
+anc_v = g['anc'] if g.get('anc') is not None else 0
+anc_p = g['anc_pct'] if g.get('anc_pct') is not None else 0
+vans_total = g.get('vans_total', 0)
+st.markdown(f"""
+<div class="funnel">
+  <div class="fstep s1"><div class="l">Recepcionado</div><div class="v">{g['total']}</div><div class="p">100%</div></div>
+  <div class="fstep s2"><div class="l">Etiquetado</div><div class="v">{g['etiq']}</div><div class="p">{g['etiq_pct']}%</div></div>
+  <div class="fstep s3"><div class="l">Anclado (vans)</div><div class="v">{anc_v}</div><div class="p">{anc_p}% · {vans_total} vans</div></div>
+  <div class="fstep s4"><div class="l">Salió a reparto</div><div class="v">{g['salio']}</div><div class="p">{g['salio_pct']}%</div></div>
+</div>
+""", unsafe_allow_html=True)
+
+# ---- ACTION BAR ----
+n_pend = int(pedidos['estado_cat'].isin(['alert', 'warn', 'orange']).sum())
+n_cuar = int((pedidos['estado_cat'] == 'priority').sum())
+n_reclass = int(pedidos['reclasificar_a'].notna().sum())
+
+k1, k2, k3 = st.columns(3)
+k1.metric("⏳ Pendientes (no salieron)", n_pend)
+k2.metric("🟣 Cuarentena", n_cuar)
+k3.metric("🔁 Reclasificar", n_reclass)
+
+if n_reclass > 0:
+    with st.expander(f"🔁 Reclasificar — la ruta indica otra flota ({n_reclass})"):
+        rec = pedidos[pedidos['reclasificar_a'].notna()].copy()
+        rec['Flota actual'] = rec['flota'].map(FLOTA_LABELS).fillna(rec['flota'])
+        rec['Debería ser'] = rec['reclasificar_a'].map(FLOTA_LABELS).fillna(rec['reclasificar_a'])
+        rec['Salida'] = rec['salio'].map({True: 'Salió', False: 'No salió'})
+        rec['TMS'] = rec.apply(tms_label_or_none, axis=1)
+        rec = rec.rename(columns={'codigo': 'Código', 'ruta': 'Ruta', 'estado_label': 'Estado'})
+        st.dataframe(rec[['Código', 'Flota actual', 'Ruta', 'Debería ser', 'Salida', 'TMS', 'Estado']],
+                     hide_index=True, use_container_width=True)
+        st.caption("Regla: ruta de 3 dígitos = Dinámico, 2 dígitos = Estático. "
+                   "Motos ancladas también caen aquí. Siguen su flujo (igual se despachan).")
+
 flota_options = ["Todas"] + [FLOTA_LABELS[f] for f in FLOTAS_VALIDAS]
 flota_sel = st.radio("Flota", flota_options, horizontal=True, label_visibility="collapsed")
 label_to_key = {v: k for k, v in FLOTA_LABELS.items()}
-flota_key = label_to_key.get(flota_sel)  # None si "Todas"
+flota_key = label_to_key.get(flota_sel)
 
-ped_view = pedidos if flota_key is None else pedidos[pedidos['flota'] == flota_key]
+tab_pedidos, tab_pendientes, tab_conos = st.tabs(["📦 Pedidos", "⏳ Pendientes", "🔵 Conos"])
 
-# ---------------------------------------------------------------------------
-# KPIs
-# ---------------------------------------------------------------------------
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Pedidos en ventana", len(ped_view))
-c2.metric("Despachados", int((ped_view['estado_cat'] == 'ok').sum()))
-c3.metric("En proceso", int((ped_view['estado_cat'] == 'warn').sum()) + int((ped_view['estado_cat'] == 'orange').sum()))
-c4.metric("Alertas", int((ped_view['estado_cat'] == 'alert').sum()))
-c5.metric("Cuarentena", int((ped_view['estado_cat'] == 'priority').sum()))
 
-# ---------------------------------------------------------------------------
-# Tabs
-# ---------------------------------------------------------------------------
-tab_pedidos, tab_conos = st.tabs(["📦 Pedidos", "🔵 Conos"])
+def salida_pills(ps):
+    salieron = int(ps['salio'].sum())
+    no = len(ps) - salieron
+    return (f'<span class="salida-ok">✅ {salieron} salieron</span> '
+            f'<span class="salida-no">⏳ {no} no</span>')
+
+
+def pct_row(ps, is_van):
+    total = len(ps)
+    etiq = round(int(ps['etiq'].sum()) / total * 100) if total else 0
+    salio = round(int(ps['salio'].sum()) / total * 100) if total else 0
+    no_salio = 100 - salio
+    if is_van:
+        anc_ok = int(((ps['anc_count'] >= ps['bultos']) & (ps['bultos'] > 0)).sum())
+        anc_str = f"{round(anc_ok / total * 100) if total else 0}%"
+    else:
+        anc_str = "N/A"
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Etiquetado", f"{etiq}%")
+    c2.metric("Anclado", anc_str)
+    c3.metric("Salió a reparto", f"{salio}%")
+    c4.metric("No salió", f"{no_salio}%")
+
+
+def render_detail_table(df_section, is_van):
+    if df_section.empty:
+        return
+    view = df_section.copy()
+    view['Código'] = view.apply(
+        lambda r: f"🔶 {r['codigo']}" if r.get('inferido') else r['codigo'], axis=1)
+    view['Etiq'] = view['etiq'].map({True: 'Sí', False: 'No'})
+    view['Anclaje'] = view.apply(lambda r: anc_text(r, is_van), axis=1)
+    view['Ruta'] = view.apply(ruta_display, axis=1)
+    view['TMS'] = view.apply(tms_label_or_none, axis=1)
+    view['Estado'] = view['estado_label']
+    view = view.rename(columns={'bultos': 'Bultos'})
+    st.dataframe(view[['Código', 'Bultos', 'Etiq', 'Anclaje', 'Ruta', 'TMS', 'Estado']],
+                 hide_index=True, use_container_width=True)
+
 
 with tab_pedidos:
-    flotas_to_show = FLOTAS_VALIDAS if flota_key is None else [flota_key]
-
-    for fl in flotas_to_show:
+    flotas_show = FLOTAS_VALIDAS if flota_key is None else [flota_key]
+    if pedidos['inferido'].any():
+        st.caption("🔶 = sin recepción en Zeus — flota inferida por su cono de anclaje")
+    for fl in flotas_show:
         ps = pedidos[pedidos['flota'] == fl]
         if ps.empty:
             continue
@@ -191,119 +243,97 @@ with tab_pedidos:
         total = len(ps)
         etiq_ok = int(ps['etiq'].sum())
         anc_ok = int(((ps['anc_count'] >= ps['bultos']) & (ps['bultos'] > 0)).sum()) if is_van else None
-        tms_ok = int((ps['tms_cat'] == 'dispatched').sum())
-        cuar = int((ps['estado_cat'] == 'priority').sum())
-        alerts = int((ps['estado_cat'] == 'alert').sum())
-        okc = int((ps['estado_cat'] == 'ok').sum())
+        salieron = int(ps['salio'].sum())
+        no_salieron = total - salieron
 
-        header = f"**{FLOTA_LABELS[fl]}** · {total} pedidos"
-        badges = []
-        if cuar:
-            badges.append(f"🟣 {cuar} cuarentena")
-        if alerts:
-            badges.append(f"🔴 {alerts} alertas")
-        badges.append(f"🟢 {okc} ok")
-        header += "  —  " + "  ·  ".join(badges)
+        flow = f"Recep {total} · Etiq {etiq_ok}"
+        flow += f" · Anclaje {anc_ok}" if is_van else " · Anclaje N/A"
+        header = f"**{FLOTA_LABELS[fl]}** · {total} pedidos  —  {flow}  —  ✅ {salieron} salieron · ⏳ {no_salieron} no"
 
-        with st.expander(header, expanded=(alerts > 0 or cuar > 0)):
-            # Pipeline resumen
-            anc_html = (f'<div class="pipe-box"><div class="v">{anc_ok}</div><div class="l">Anclaje</div>'
-                        f'<div class="s" style="color:{"#f85149" if total-anc_ok>0 else "#2ea043"}">'
-                        f'{"faltan "+str(total-anc_ok) if total-anc_ok>0 else "todos ✓"}</div></div>'
-                        if is_van else
-                        '<div class="pipe-box" style="opacity:.4"><div class="v">N/A</div><div class="l">Anclaje</div><div class="s">no aplica</div></div>')
+        with st.expander(header, expanded=(no_salieron > 0)):
+            pct_row(ps, is_van)
+            no_salio_df = ps[~ps['salio']]
+            if no_salio_df.empty:
+                st.success("✓ Todos los pedidos de esta flota ya salieron a reparto")
+            else:
+                st.markdown(f"**No salieron — requieren acción ({len(no_salio_df)})**")
+                render_detail_table(no_salio_df, is_van)
 
-            def box(label, val, missing):
-                color = "#f85149" if missing > 0 else "#2ea043"
-                sub = f"faltan {missing}" if missing > 0 else "todos ✓"
-                return (f'<div class="pipe-box"><div class="v">{val}</div><div class="l">{label}</div>'
-                        f'<div class="s" style="color:{color}">{sub}</div></div>')
+            with st.expander(f"Ver los {total} pedidos completos"):
+                render_detail_table(ps, is_van)
 
-            pipe_html = ('<div class="pipe">' + box('Recepción', total, 0) +
-                         '<span class="pipe-arrow">→</span>' + box('Etiquetado', etiq_ok, total - etiq_ok) +
-                         '<span class="pipe-arrow">→</span>' + anc_html +
-                         '<span class="pipe-arrow">→</span>' + box('TMS', tms_ok, total - tms_ok) + '</div>')
-            st.markdown(pipe_html, unsafe_allow_html=True)
-
-            # --- Secciones de pendientes ---
-            def render_section(title, color, df_section, extra_cols=()):
-                if df_section.empty:
-                    return
-                st.markdown(f"<div style='font-size:12px;font-weight:600;color:{color};margin:10px 0 4px'>"
-                             f"{title} — {len(df_section)}</div>", unsafe_allow_html=True)
-                view = df_section.copy()
-                view['Anclaje'] = view.apply(lambda r: anc_text(r, is_van), axis=1)
-                view['TMS'] = view['tms_label'].fillna('Sin registro')
-                view['Estado'] = view['estado_label']
-                cols = ['codigo', 'bultos'] + list(extra_cols) + ['Anclaje', 'TMS', 'Estado']
-                view = view.rename(columns={'codigo': 'Código', 'bultos': 'Bultos'})
-                cols_renamed = ['Código', 'Bultos'] + list(extra_cols) + ['Anclaje', 'TMS', 'Estado']
-                st.dataframe(view[cols_renamed], hide_index=True, use_container_width=True)
-
-            sin_eti = ps[~ps['etiq']]
-            render_section("🔴 Sin etiquetar", "#f85149", sin_eti)
-
-            if is_van:
-                sin_anc = ps[(ps['etiq']) & (ps['anc_count'] < ps['bultos'])]
-                render_section("🔴 Sin anclar / anclaje incompleto", "#f85149", sin_anc)
-
-            cuarentena = ps[ps['estado_cat'] == 'priority']
-            render_section("🟣 Cuarentena — no deben salir", "#c084fc", cuarentena)
-
-            pendientes = ps[ps['estado_cat'].isin(['warn', 'orange'])]
-            render_section("🟡 Pendiente TMS / revisar", "#d29922", pendientes)
-
-            if alerts == 0 and cuar == 0 and len(pendientes) == 0:
-                st.success("✓ Todos los pedidos completos en esta ventana")
-
-            # Ver todos
-            with st.expander(f"Ver todos los {total} pedidos de {FLOTA_LABELS[fl]}"):
-                allv = ps.copy()
-                allv['Anclaje'] = allv.apply(lambda r: anc_text(r, is_van), axis=1)
-                allv['TMS'] = allv['tms_label'].fillna('Sin registro')
-                allv = allv.rename(columns={'codigo': 'Código', 'bultos': 'Bultos',
-                                             'etiq': 'Etiquetado', 'estado_label': 'Estado'})
-                st.dataframe(allv[['Código', 'Bultos', 'Etiquetado', 'Anclaje', 'TMS', 'Estado']],
-                              hide_index=True, use_container_width=True)
-
-    # Sin recepción
     if not sin_recep.empty and flota_key is None:
-        with st.expander(f"⚪ Sin recepción — {len(sin_recep)} códigos (en etiquetado/anclaje/TMS pero no en Zeus)"):
+        with st.expander(f"⚪ Sin flota / Sin recepción — {len(sin_recep)} códigos"):
             view = sin_recep.copy()
-            view['TMS'] = view['tms_label'].fillna('Sin registro')
-            view = view.rename(columns={'codigo': 'Código', 'etiq': 'Etiquetado', 'anc_count': 'Anclaje (filas)'})
-            st.dataframe(view[['Código', 'Etiquetado', 'Anclaje (filas)', 'TMS']],
-                          hide_index=True, use_container_width=True)
+            view['Etiq'] = view['etiq'].map({True: 'Sí', False: 'No'})
+            view['TMS'] = view.apply(tms_label_or_none, axis=1)
+            view = view.rename(columns={'codigo': 'Código', 'anc_count': 'Anclaje (filas)', 'ruta': 'Ruta'})
+            st.dataframe(view[['Código', 'Etiq', 'Anclaje (filas)', 'Ruta', 'TMS']],
+                         hide_index=True, use_container_width=True)
+
+
+with tab_pendientes:
+    flotas_show = FLOTAS_VALIDAS if flota_key is None else [flota_key]
+    any_pend = False
+    for fl in flotas_show:
+        ps = pedidos[pedidos['flota'] == fl]
+        if ps.empty:
+            continue
+        is_van = fl != 'OF MOTORIZADOS'
+        pend = ps[ps['estado_cat'].isin(['alert', 'warn', 'orange'])]
+        st.markdown(f"#### {FLOTA_LABELS[fl]} · {len(ps)} pedidos")
+        st.markdown(salida_pills(ps), unsafe_allow_html=True)
+        pct_row(ps, is_van)
+        if pend.empty:
+            st.success("✓ Sin pendientes en esta flota")
+        else:
+            any_pend = True
+            render_detail_table(pend, is_van)
+        st.divider()
+    if not any_pend:
+        st.info("No hay pedidos pendientes en la selección actual.")
+
 
 with tab_conos:
-    conos = build_conos(ped_view)
+    pool = pedidos if flota_key is None else pedidos[pedidos['flota'] == flota_key]
+    conos = build_conos(pool)
     if conos.empty:
         st.info("No hay conos con anclaje en esta ventana.")
     else:
-        st.caption(f"{len(conos)} conos · {int((conos['sin_migrar']>0).sum())} con pendientes "
-                   "(ordenados por mayor cantidad sin migrar)")
-        for _, c in conos.iterrows():
-            total, migr, nomig = int(c['total']), int(c['migrados']), int(c['sin_migrar'])
-            if nomig == 0:
-                estado_b = badge('Completo', 'ok')
-            elif migr == 0:
-                estado_b = badge('Pendiente', 'warn')
-            else:
-                estado_b = badge(f'{nomig} sin migrar', 'alert')
+        prioridad = conos[(conos['migrados'] > 0) & (conos['sin_migrar'] > 0)]
+        pendiente = conos[conos['migrados'] == 0]
+        completo = conos[conos['sin_migrar'] == 0]
 
-            header = (f"**{c['cono']}** · {FLOTA_LABELS.get(c['flota'], c['flota'])} · "
-                      f"{migr}/{total} migrados ({int(c['pct'])}%)")
-            with st.expander(header, expanded=(nomig > 0)):
-                st.markdown(estado_b, unsafe_allow_html=True)
-                items = ped_view[(ped_view['cono'] == c['cono']) & (ped_view['flota'] != 'OF MOTORIZADOS')]
-                view = items.copy()
-                view['TMS'] = view['tms_label'].fillna('Sin registro')
-                view = view.rename(columns={'codigo': 'Código', 'bultos': 'Bultos'})
-                st.dataframe(view[['Código', 'Bultos', 'TMS']], hide_index=True, use_container_width=True)
+        def render_conos(df_conos, titulo):
+            if df_conos.empty:
+                return
+            st.markdown(f"**{titulo}**")
+            for _, c in df_conos.iterrows():
+                total, migr, nomig = int(c['total']), int(c['migrados']), int(c['sin_migrar'])
+                pct = int(c['pct'])
+                if nomig == 0:
+                    estado = "🟢 Completo"
+                elif migr == 0:
+                    estado = "🟡 Pendiente"
+                else:
+                    estado = f"🔴 {nomig} sin migrar"
+                hdr = (f"{c['cono']} · {FLOTA_LABELS.get(c['flota'], c['flota'])} · "
+                       f"{migr}/{total} salieron ({pct}%) · {estado}")
+                with st.expander(hdr, expanded=(nomig > 0 and migr > 0)):
+                    items = pool[(pool['cono'] == c['cono']) & (pool['flota'] != 'OF MOTORIZADOS')].copy()
+                    items['Salida'] = items.apply(
+                        lambda r: ('Salió · ' + str(r['tms_label'])) if r['salio']
+                        else ('No salió · ' + (str(r['tms_label']) if pd.notna(r['tms_label']) else 'Sin registro')),
+                        axis=1)
+                    items = items.rename(columns={'codigo': 'Código', 'bultos': 'Bultos'})
+                    st.dataframe(items[['Código', 'Bultos', 'Salida']],
+                                 hide_index=True, use_container_width=True)
 
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
+        render_conos(prioridad, "🔴 Prioridad — sin migrar (ubicar ya)")
+        render_conos(pendiente, "🟡 Aún sin despachar (0 salieron)")
+        render_conos(completo, "🟢 Completos")
+
+
 st.divider()
 
 
@@ -313,11 +343,15 @@ def to_excel_bytes(pedidos_df, sin_recep_df):
         'Código': out['codigo'],
         'Flota': out['flota'].map(FLOTA_LABELS).fillna(out['flota']),
         'Bultos': out['bultos'],
-        'Recepción': out['recep'].fillna(False).map({True: 'Sí', False: 'No'}),
         'Etiquetado': out['etiq'].map({True: 'Sí', False: 'No'}),
-        'Anclaje': out.apply(lambda r: 'N/A' if r['flota'] == 'OF MOTORIZADOS' else f"{int(r['anc_count'])}/{int(r['bultos']) if pd.notna(r['bultos']) else 0}", axis=1),
+        'Anclaje': out.apply(
+            lambda r: 'N/A' if r['flota'] == 'OF MOTORIZADOS'
+            else f"{int(r['anc_count'])}/{int(r['bultos']) if pd.notna(r['bultos']) else 0}", axis=1),
+        'Ruta': out['ruta'] if 'ruta' in out.columns else '',
+        'Reclasificar a': out['reclasificar_a'].map(FLOTA_LABELS).fillna(out['reclasificar_a']) if 'reclasificar_a' in out.columns else '',
         'Cono': out['cono'].fillna(''),
-        'Estado TMS': out['tms_label'].fillna('Sin registro'),
+        'Salió': out['salio'].map({True: 'Sí', False: 'No'}) if 'salio' in out.columns else 'No',
+        'Estado TMS': out.apply(tms_label_or_none, axis=1),
         'Estado final': out['estado_label'],
     })
     buf = io.BytesIO()
