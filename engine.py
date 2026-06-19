@@ -25,26 +25,29 @@ TMS_MAP = {
     'REENVIO CLIENTE':      {'cat': 'pending',    'label': 'Reenvío'},
     'REGISTRADO':           {'cat': 'review',     'label': 'Registrado'},
     'CUARENTENA':           {'cat': 'quarantine', 'label': 'Cuarentena'},
+    # Estados resueltos que NO son pendientes ni salieron físicamente.
+    # No aparecen en vistas de pendientes/conos, solo en el detalle completo.
+    'RECHAZADO':            {'cat': 'no_action',  'label': 'Rechazado'},
+    'EN CUSTODIA':          {'cat': 'no_action',  'label': 'En custodia'},
+    'FALLO DE ENTREGA':     {'cat': 'no_action',  'label': 'Fallo de entrega'},
+    'ANULADO':              {'cat': 'no_action',  'label': 'Anulado'},
+    'TRANSITO LOCAL':       {'cat': 'no_action',  'label': 'Tránsito local'},
+    'EN DEVOLUCION':        {'cat': 'no_action',  'label': 'En devolución'},
 }
-
-# Estados de TMS que se IGNORAN (se tratan como "sin registro") para las
-# 3 flotas actuales. Ej: "Tránsito local" no aplica para estas flotas hoy,
-# pero al escalar a otras flotas podría sí ser relevante para ellas.
-TMS_IGNORAR_PARA_FLOTAS_ACTUALES = {'TRANSITO LOCAL'}
 
 # Posiciones de columna por índice (A=0, B=1, ... E=4, G=6, K=10, M=12, T=19)
 COL_ZEUS_CODIGO, COL_ZEUS_FLOTA, COL_ZEUS_FECHA, COL_ZEUS_TIPOREC, COL_ZEUS_BULTOS = 0, 4, 6, 12, 19
 COL_ETI_CODIGO, COL_ETI_FECHA = 0, 4
 COL_ANC_CODIGO, COL_ANC_CONO, COL_ANC_RUTA, COL_ANC_FECHA = 0, 4, 6, 10
 
-# Cuántos dígitos debe tener la ruta según la flota van.
-# Esto define tanto la validación de ruta como la inferencia de reclasificación.
+# Cuántos dígitos debe tener la ruta según la flota.
 RUTA_DIGITOS = {
-    'VANS RUTEO DINAMICO': 3,
+    'OF MOTORIZADOS': 1,
     'VANS RUTEO ESTATICO': 2,
+    'VANS RUTEO DINAMICO': 3,
 }
 # Mapa inverso: cuántos dígitos -> a qué flota pertenece realmente
-DIGITOS_A_FLOTA = {3: 'VANS RUTEO DINAMICO', 2: 'VANS RUTEO ESTATICO'}
+DIGITOS_A_FLOTA = {1: 'OF MOTORIZADOS', 2: 'VANS RUTEO ESTATICO', 3: 'VANS RUTEO DINAMICO'}
 
 
 # ---------------------------------------------------------------------------
@@ -171,18 +174,15 @@ def read_tms(file, filename: str) -> tuple[pd.DataFrame, int]:
 # ---------------------------------------------------------------------------
 def _resolve_tms(tms_raw, flota):
     """Resuelve el estado TMS contra la lista blanca (TMS_MAP).
-    Si el estado no está en la lista (desconocido) o es 'Tránsito local'
-    para una flota actual, se trata EXACTAMENTE como si no hubiera
-    registro TMS: tms_cat=None y tms_label=None (no se muestra el texto
-    crudo del estado desconocido)."""
+    Si el estado no está en la lista (desconocido), se trata como si no
+    hubiera registro TMS: tms_cat=None y tms_label=None.
+    Los estados conocidos de categoría 'no_action' (Rechazado, Anulado, etc.)
+    SÍ se resuelven: tienen registro, pero no son pendientes ni salieron."""
     if not tms_raw:
         return None, None
-    tms_norm = norm(tms_raw)
-    if tms_norm in TMS_IGNORAR_PARA_FLOTAS_ACTUALES and flota in FLOTAS_VALIDAS:
-        return None, None
-    tms_info = TMS_MAP.get(tms_norm)
+    tms_info = TMS_MAP.get(norm(tms_raw))
     if not tms_info:
-        return None, None  # estado no reconocido -> se ignora por completo
+        return None, None  # estado desconocido -> sin registro
     return tms_info['cat'], tms_info['label']
 
 
@@ -200,30 +200,42 @@ def _ruta_digitos(ruta):
 
 
 def _analizar_ruta_y_flota(flota, anc_count, ruta_digs):
-    """Devuelve (reclasificar_a, ruta_alerta) para un pedido.
+    """Devuelve (reclasificar_a, ruta_alerta, descartar) para un pedido.
 
-    Reglas:
-      * OF MOTORIZADOS con anclaje  -> reclasificar según dígitos de ruta.
-      * Van con ruta del largo de la OTRA flota van -> reclasificar.
-      * Van sin ruta o con largo no válido (ni 2 ni 3) -> ruta inválida.
+    Reglas de dígitos de ruta:
+      1 díg = OF MOTORIZADOS, 2 díg = ESTÁTICO, 3 díg = DINÁMICO.
+      4+ díg = no pertenece a estas flotas -> descartar (no se muestra).
+
+    - Si la ruta indica una flota distinta a la asignada -> reclasificar.
+    - Motos sin anclaje no tienen ruta: no se descartan ni reclasifican.
+    - Vans sin ruta -> marca discreta (ruta_alerta='Sin ruta').
     """
-    reclasificar_a, ruta_alerta = None, None
+    reclasificar_a, ruta_alerta, descartar = None, None, False
+
+    # 4+ dígitos: no pertenece a ninguna de las 3 flotas -> descartar del panel
+    if ruta_digs >= 4:
+        return None, None, True
 
     if flota == 'OF MOTORIZADOS':
-        if anc_count > 0:  # moto anclada = mal clasificada
-            reclasificar_a = DIGITOS_A_FLOTA.get(ruta_digs, 'VANS (ruta no clara)')
-        return reclasificar_a, ruta_alerta
+        # Las motos normalmente no se anclan (no tienen ruta). Si tienen
+        # anclaje con ruta, la ruta dice a qué flota pertenecen realmente.
+        if anc_count > 0 and ruta_digs > 0:
+            destino = DIGITOS_A_FLOTA.get(ruta_digs)
+            if destino and destino != 'OF MOTORIZADOS':
+                reclasificar_a = destino
+        return reclasificar_a, ruta_alerta, descartar
 
+    # Vans:
     esperado = RUTA_DIGITOS.get(flota)
     if ruta_digs == 0:
         ruta_alerta = 'Sin ruta'
     elif ruta_digs == esperado:
-        pass
-    elif ruta_digs in DIGITOS_A_FLOTA:
-        reclasificar_a = DIGITOS_A_FLOTA[ruta_digs]  # largo válido pero de la otra flota
+        pass  # correcto
     else:
-        ruta_alerta = f'Ruta inválida ({ruta_digs} díg)'
-    return reclasificar_a, ruta_alerta
+        destino = DIGITOS_A_FLOTA.get(ruta_digs)
+        if destino:
+            reclasificar_a = destino  # 1, 2 o 3 dígitos de otra flota
+    return reclasificar_a, ruta_alerta, descartar
 
 
 def run_engine(zeus_df, etiq_df, anc_df, tms_df, desde, hasta):
@@ -276,9 +288,11 @@ def run_engine(zeus_df, etiq_df, anc_df, tms_df, desde, hasta):
         cono = anc_cono.get(cod)
         ruta = anc_ruta.get(cod)
         ruta_digs = _ruta_digitos(ruta)
+        reclasificar_a, ruta_alerta, descartar = _analizar_ruta_y_flota(flota, anc_count, ruta_digs)
+        if descartar:
+            return None  # ruta de 4+ dígitos: no pertenece a estas flotas
         tms_raw = tms_estado.get(cod)
         tms_cat, tms_label = _resolve_tms(tms_raw, flota)
-        reclasificar_a, ruta_alerta = _analizar_ruta_y_flota(flota, anc_count, ruta_digs)
         p = {
             'codigo': cod, 'flota': flota, 'bultos': bultos, 'inferido': inferido,
             'recep': True, 'etiq': etiq, 'anc_count': anc_count, 'cono': cono,
@@ -295,7 +309,9 @@ def run_engine(zeus_df, etiq_df, anc_df, tms_df, desde, hasta):
     pedidos = []
     zeus_codes = set(z['_cod'])
     for _, row in z_validas.iterrows():
-        pedidos.append(_build_pedido(row['_cod'], row['_flota'], int(row['_bultos']), inferido=False))
+        p = _build_pedido(row['_cod'], row['_flota'], int(row['_bultos']), inferido=False)
+        if p is not None:
+            pedidos.append(p)
 
     # ---- Mapa cono -> flota, construido SOLO con vans de Zeus (el anclaje/cono
     # es un concepto de vans; sirve de referencia para inferir la flota de huérfanos).
@@ -325,7 +341,9 @@ def run_engine(zeus_df, etiq_df, anc_df, tms_df, desde, hasta):
         if flota_inferida:
             # Bultos = filas de anclaje (no hay Zeus para saber el valor real;
             # así nunca sale "anclaje parcial" falso para estos casos).
-            pedidos.append(_build_pedido(cod, flota_inferida, max(anc_count, 1), inferido=True))
+            p = _build_pedido(cod, flota_inferida, max(anc_count, 1), inferido=True)
+            if p is not None:  # None si la ruta tiene 4+ dígitos -> descartado
+                pedidos.append(p)
             continue
 
         tms_raw = tms_estado.get(cod)
@@ -401,6 +419,11 @@ def _compute_estado(p):
     # sin importar si falta etiquetado/anclaje (solo Cuarentena lo bloquea).
     if p['tms_cat'] == 'dispatched':
         return ('Entregado' if p['tms_label'] == 'Entregado' else 'Despachado'), 'ok'
+    # Estados resueltos que no son pendientes ni salieron (Rechazado, Anulado,
+    # En custodia, etc.): muestran su estado real, categoría 'no_action'.
+    # No alertan por falta de etiquetado/anclaje porque ya están resueltos.
+    if p['tms_cat'] == 'no_action':
+        return p['tms_label'], 'no_action'
     if not p['etiq']:
         return 'Sin etiquetar', 'alert'
     if is_van:
