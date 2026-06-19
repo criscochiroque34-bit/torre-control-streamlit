@@ -25,6 +25,7 @@ st.markdown("""
 .b-priority{background:#1a0a2a;color:#c084fc;border:1px solid #6b3fa0}
 .b-gray{background:#1a2130;color:#8b98a5;border:1px solid #283041}
 .b-cyan{background:#08222a;color:#3fb6d3;border:1px solid #1d5566}
+.b-noaction{background:#1a1a1a;color:#6e7681;border:1px solid #30363d}
 .funnel{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0}
 .fstep{flex:1;min-width:120px;background:#1c2230;border:1px solid #283041;border-radius:9px;padding:10px 13px}
 .fstep .l{font-size:11px;color:#8b98a5;text-transform:uppercase;letter-spacing:.04em}
@@ -161,14 +162,20 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ---- ACTION BAR ----
-n_pend = int(pedidos['estado_cat'].isin(['alert', 'warn', 'orange']).sum())
+# Pendientes = alertas + en proceso. NO incluye cuarentena (informativo) ni
+# no_action (resueltos: rechazado, anulado, etc.).
+es_pendiente = pedidos['estado_cat'].isin(['alert', 'warn', 'orange'])
+n_pend = int(es_pendiente.sum())
 n_cuar = int((pedidos['estado_cat'] == 'priority').sum())
 n_reclass = int(pedidos['reclasificar_a'].notna().sum())
+# No salieron = todo lo que NO salió físicamente y NO es cuarentena ni no_action.
+n_no_salio = int((~pedidos['salio'] & ~pedidos['estado_cat'].isin(['priority', 'no_action'])).sum())
 
-k1, k2, k3 = st.columns(3)
-k1.metric("⏳ Pendientes (no salieron)", n_pend)
-k2.metric("🟣 Cuarentena", n_cuar)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("⏳ Pendientes", n_pend)
+k2.metric("🔴 No salieron", n_no_salio)
 k3.metric("🔁 Reclasificar", n_reclass)
+k4.metric("🟣 Cuarentena", n_cuar, help="Informativo — no cuenta como pendiente")
 
 if n_reclass > 0:
     with st.expander(f"🔁 Reclasificar — la ruta indica otra flota ({n_reclass})"):
@@ -180,8 +187,8 @@ if n_reclass > 0:
         rec = rec.rename(columns={'codigo': 'Código', 'ruta': 'Ruta', 'estado_label': 'Estado'})
         st.dataframe(rec[['Código', 'Flota actual', 'Ruta', 'Debería ser', 'Salida', 'TMS', 'Estado']],
                      hide_index=True, use_container_width=True)
-        st.caption("Regla: ruta de 3 dígitos = Dinámico, 2 dígitos = Estático. "
-                   "Motos ancladas también caen aquí. Siguen su flujo (igual se despachan).")
+        st.caption("Regla de ruta: 1 dígito = Motorizados, 2 = Estático, 3 = Dinámico. "
+                   "Si la ruta indica otra flota, se sugiere reclasificar. Siguen su flujo (igual se despachan).")
 
 flota_options = ["Todas"] + [FLOTA_LABELS[f] for f in FLOTAS_VALIDAS]
 flota_sel = st.radio("Flota", flota_options, horizontal=True, label_visibility="collapsed")
@@ -273,25 +280,33 @@ with tab_pedidos:
 
 
 with tab_pendientes:
-    flotas_show = FLOTAS_VALIDAS if flota_key is None else [flota_key]
-    any_pend = False
-    for fl in flotas_show:
-        ps = pedidos[pedidos['flota'] == fl]
-        if ps.empty:
-            continue
-        is_van = fl != 'OF MOTORIZADOS'
-        pend = ps[ps['estado_cat'].isin(['alert', 'warn', 'orange'])]
-        st.markdown(f"#### {FLOTA_LABELS[fl]} · {len(ps)} pedidos")
-        st.markdown(salida_pills(ps), unsafe_allow_html=True)
-        pct_row(ps, is_van)
-        if pend.empty:
-            st.success("✓ Sin pendientes en esta flota")
-        else:
-            any_pend = True
-            render_detail_table(pend, is_van)
-        st.divider()
-    if not any_pend:
-        st.info("No hay pedidos pendientes en la selección actual.")
+    # Pendientes = una sola tabla unificada (todas las flotas juntas),
+    # se filtra al elegir una flota con los botones de arriba.
+    pend_all = pedidos[pedidos['estado_cat'].isin(['alert', 'warn', 'orange'])].copy()
+    if flota_key is not None:
+        pend_all = pend_all[pend_all['flota'] == flota_key]
+
+    st.markdown(f"**{len(pend_all)} pedidos pendientes**"
+                + (f" · {FLOTA_LABELS[flota_key]}" if flota_key else " · todas las flotas")
+                + "  —  usa los botones de arriba para filtrar por flota")
+
+    if pend_all.empty:
+        st.success("✓ No hay pedidos pendientes en la selección actual.")
+    else:
+        view = pend_all.copy()
+        view['Código'] = view.apply(
+            lambda r: f"🔶 {r['codigo']}" if r.get('inferido') else r['codigo'], axis=1)
+        view['Flota'] = view['flota'].map(FLOTA_LABELS).fillna(view['flota'])
+        view['Etiq'] = view['etiq'].map({True: 'Sí', False: 'No'})
+        view['Anclaje'] = view.apply(
+            lambda r: anc_text(r, r['flota'] != 'OF MOTORIZADOS'), axis=1)
+        view['Ruta'] = view.apply(ruta_display, axis=1)
+        view['TMS'] = view.apply(tms_label_or_none, axis=1)
+        view['Estado'] = view['estado_label']
+        st.dataframe(
+            view[['Código', 'Flota', 'bultos', 'Etiq', 'Anclaje', 'Ruta', 'TMS', 'Estado']]
+            .rename(columns={'bultos': 'Bultos'}),
+            hide_index=True, use_container_width=True)
 
 
 with tab_conos:
