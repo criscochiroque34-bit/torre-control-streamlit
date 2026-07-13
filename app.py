@@ -107,8 +107,8 @@ with st.sidebar:
     hasta = pd.Timestamp(datetime.combine(hasta_date, hasta_time))
 
     st.divider()
-    procesar = st.button("🚀 Procesar", type="primary", use_container_width=True)
-    if st.button("🗑️ Limpiar", use_container_width=True):
+    procesar = st.button("🚀 Procesar", type="primary", width='stretch')
+    if st.button("🗑️ Limpiar", width='stretch'):
         st.session_state.result = None
         st.rerun()
 
@@ -205,7 +205,7 @@ if n_reclass > 0:
         rec['Estado TMS']   = rec.apply(tms_real_or_none, axis=1)
         rec = rec.rename(columns={'codigo':'Código','ruta':'Ruta','estado_label':'Estado'})
         st.dataframe(rec[['Código','Flota actual','Ruta','Debería ser','Salida','Estado TMS','Estado']],
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width='stretch')
         st.caption("Ruta: 1 dígito = Motorizados · 2 = Estático · 3 = Dinámico. "
                    "Siguen su flujo normal (igual se despachan).")
 
@@ -255,7 +255,7 @@ def render_detail_table(df_sec, is_van):
     v['Estado']     = v['estado_label']
     v = v.rename(columns={'bultos':'Bultos'})
     st.dataframe(v[['Código','Bultos','Etiq','Anclaje','Ruta','Estado TMS','Estado']],
-                 hide_index=True, use_container_width=True)
+                 hide_index=True, width='stretch')
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ with tab_pedidos:
             v['Estado TMS']= v.apply(tms_real_or_none, axis=1)
             v = v.rename(columns={'codigo':'Código','anc_count':'Anclaje (filas)','ruta':'Ruta'})
             st.dataframe(v[['Código','Etiq','Anclaje (filas)','Ruta','Estado TMS']],
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width='stretch')
 
 # ---------------------------------------------------------------------------
 # TAB PENDIENTES
@@ -328,7 +328,7 @@ with tab_pend:
         st.dataframe(
             v[['Código','Flota','bultos','Etiq','Anclaje','Ruta','Estado TMS','Estado']]
             .rename(columns={'bultos':'Bultos'}),
-            hide_index=True, use_container_width=True)
+            hide_index=True, width='stretch')
 
 # ---------------------------------------------------------------------------
 # TAB CONOS
@@ -388,7 +388,7 @@ with tab_conos:
                     items['Anclaje estado'] = items['estado_anclaje'].apply(estado_anclaje_icon)
                     items = items.rename(columns={'codigo':'Código','bultos':'Bultos'})
                     st.dataframe(items[['Código','Bultos','Anclaje','Anclaje estado','Salida']],
-                                 hide_index=True, use_container_width=True)
+                                 hide_index=True, width='stretch')
 
         render_conos(prioridad, "🔴 Prioridad — sin migrar (ubicar ya)")
         render_conos(pendiente, "🟡 Aún sin despachar (0 salieron)")
@@ -486,7 +486,7 @@ with col_d1:
         data=excel_pendientes(pedidos, sin_recep),
         file_name=f"pendientes_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width='stretch',
     )
 
 with col_d2:
@@ -495,5 +495,5 @@ with col_d2:
         data=excel_bultos(pedidos),
         file_name=f"bultos_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width='stretch',
     )
