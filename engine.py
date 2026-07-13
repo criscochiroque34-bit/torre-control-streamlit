@@ -8,6 +8,8 @@ import unicodedata
 import re
 import zipfile
 import io
+import tempfile
+import os
 
 FLOTAS_VALIDAS = ['OF MOTORIZADOS', 'VANS RUTEO DINAMICO', 'VANS RUTEO ESTATICO']
 FLOTA_LABELS = {
@@ -79,6 +81,15 @@ def _clean_str(v):
     return str(v).strip()
 
 
+def _col(df, idx):
+    """Lee una columna por índice de forma segura. Si el índice no existe
+    (archivo con menos columnas de las esperadas), devuelve una columna de
+    None del mismo largo en vez de crashear con KeyError."""
+    if idx < df.shape[1]:
+        return df[df.columns[idx]]
+    return pd.Series([None] * len(df), index=df.index)
+
+
 # ---------------------------------------------------------------------------
 # Lectores de archivo
 # ---------------------------------------------------------------------------
@@ -114,8 +125,28 @@ def _read_csv_bytes(raw_bytes: bytes) -> pd.DataFrame:
     raise ValueError('No se pudo leer el CSV con ningún encoding/separador conocido')
 
 
+def _find_tms_columns(header_bytes: bytes):
+    """Lee solo la primera línea del CSV para detectar el encoding correcto y
+    los nombres reales de las columnas que necesitamos, sin cargar todo."""
+    primary = _detect_encoding(header_bytes[:4])
+    encodings = list(dict.fromkeys([primary, 'utf-8-sig', 'utf-16', 'latin-1']))
+    for enc in encodings:
+        try:
+            head = pd.read_csv(io.BytesIO(header_bytes), encoding=enc, dtype=str, nrows=0)
+            cols_norm = {norm(c): c for c in head.columns}
+            if 'NUMERO' in cols_norm and 'NOMBREESTADOENVIO' in cols_norm:
+                return enc, cols_norm
+        except Exception:
+            continue
+    return None, None
+
+
 def read_tms(file, filename: str) -> tuple[pd.DataFrame, int]:
-    """Lee TMS (zip->csv o csv), deduplica por código (más reciente).
+    """Lee TMS (zip->csv o csv) de forma eficiente en memoria:
+    - Solo lee las 3 columnas necesarias (no todo el archivo).
+    - Procesa en chunks para no cargar millones de filas de una vez.
+    - Deduplica incrementalmente (se queda con el registro más reciente).
+    Esto evita picos de memoria que causan Segmentation fault (OOM) en la nube.
     Devuelve (df_dedup, total_filas_raw)."""
     if filename.lower().endswith('.zip'):
         with zipfile.ZipFile(io.BytesIO(file.read())) as z:
@@ -126,21 +157,59 @@ def read_tms(file, filename: str) -> tuple[pd.DataFrame, int]:
     else:
         raw_bytes = file.read()
 
-    raw = _read_csv_bytes(raw_bytes)
-    raw.columns = [norm(c) for c in raw.columns]
+    # Detectar encoding y nombres reales de columna con solo el encabezado
+    enc, cols_norm = _find_tms_columns(raw_bytes[:8192])
+    if enc is None:
+        raise ValueError("No se encontraron las columnas 'NUMERO' y "
+                         "'NOMBREESTADOENVIO' en el TMS. Revisa el archivo.")
 
-    cod_col, est_col, fecha_col = 'NUMERO', 'NOMBREESTADOENVIO', 'ENREPARTO'
-    for required in (cod_col, est_col):
-        if required not in raw.columns:
-            raise ValueError(f"No se encontró '{required}' en el TMS. "
-                             f"Columnas: {', '.join(raw.columns[:15])}...")
+    col_num   = cols_norm['NUMERO']
+    col_est   = cols_norm['NOMBREESTADOENVIO']
+    col_fecha = cols_norm.get('ENREPARTO')
+    usecols   = [c for c in (col_num, col_est, col_fecha) if c is not None]
 
-    total_raw = len(raw)
-    raw['_cod'] = raw[cod_col].apply(norm_code)
-    raw = raw[raw['_cod'] != '']
-    raw['_fecha'] = pd.to_datetime(raw[fecha_col], errors='coerce') if fecha_col in raw.columns else pd.NaT
-    raw = raw.sort_values('_fecha', na_position='first')
-    dedup = raw.groupby('_cod', as_index=False).last()
+    # Escribir los bytes a un archivo temporal en DISCO y liberar la copia en
+    # RAM cuanto antes. Leer por chunks desde disco mantiene la memoria acotada
+    # (evita el Segmentation fault por OOM en la nube con archivos grandes).
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp:
+            tmp.write(raw_bytes)
+            tmp_path = tmp.name
+        del raw_bytes  # liberar ~150 MB de RAM inmediatamente
+
+        total_raw = 0
+        partes = []
+        reader = pd.read_csv(
+            tmp_path, encoding=enc, dtype=str,
+            usecols=usecols, chunksize=200_000,
+        )
+        for chunk in reader:
+            total_raw += len(chunk)
+            sub = pd.DataFrame({
+                '_cod': chunk[col_num].apply(norm_code),
+                'NOMBREESTADOENVIO': chunk[col_est].values,
+            })
+            if col_fecha is not None:
+                sub['_fecha'] = pd.to_datetime(chunk[col_fecha], errors='coerce').values
+            else:
+                sub['_fecha'] = pd.NaT
+            sub = sub[sub['_cod'] != '']
+            if sub.empty:
+                continue
+            sub = sub.sort_values('_fecha', na_position='first')
+            sub = sub.groupby('_cod', as_index=False).last()
+            partes.append(sub)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    if not partes:
+        return pd.DataFrame(columns=['_cod', 'NOMBREESTADOENVIO', '_fecha']), total_raw
+
+    combinado = pd.concat(partes, ignore_index=True)
+    combinado = combinado.sort_values('_fecha', na_position='first')
+    dedup = combinado.groupby('_cod', as_index=False).last()
     return dedup, total_raw
 
 
@@ -256,10 +325,10 @@ def run_engine(zeus_df, etiq_df, anc_df, tms_df, desde, hasta) -> dict:
 
     # Zeus
     z = zeus_df.copy()
-    z['_cod']   = z[COL_ZEUS_CODIGO].apply(norm_code)
-    z['_fecha'] = pd.to_datetime(z[COL_ZEUS_FECHA], errors='coerce')
-    z['_flota'] = z[COL_ZEUS_FLOTA].apply(norm)
-    z['_bultos'] = pd.to_numeric(z[COL_ZEUS_BULTOS], errors='coerce').fillna(1).astype(int).clip(lower=1)
+    z['_cod']   = _col(z, COL_ZEUS_CODIGO).apply(norm_code)
+    z['_fecha'] = pd.to_datetime(_col(z, COL_ZEUS_FECHA), errors='coerce')
+    z['_flota'] = _col(z, COL_ZEUS_FLOTA).apply(norm)
+    z['_bultos'] = pd.to_numeric(_col(z, COL_ZEUS_BULTOS), errors='coerce').fillna(1).astype(int).clip(lower=1)
     z = z[z['_cod'] != '']
     z = z[(z['_fecha'] >= desde) & (z['_fecha'] <= hasta)]
     z = z.sort_values('_fecha').groupby('_cod', as_index=False).last()
@@ -267,18 +336,18 @@ def run_engine(zeus_df, etiq_df, anc_df, tms_df, desde, hasta) -> dict:
 
     # Etiquetado
     e = etiq_df.copy()
-    e['_cod']   = e[COL_ETI_CODIGO].apply(norm_code)
-    e['_fecha'] = pd.to_datetime(e[COL_ETI_FECHA], errors='coerce')
+    e['_cod']   = _col(e, COL_ETI_CODIGO).apply(norm_code)
+    e['_fecha'] = pd.to_datetime(_col(e, COL_ETI_FECHA), errors='coerce')
     e = e[e['_cod'] != '']
     e = e[(e['_fecha'] >= desde) & (e['_fecha'] <= hasta)]
     etiq_codes = set(e['_cod'].unique())
 
     # Anclaje
     a = anc_df.copy()
-    a['_cod']   = a[COL_ANC_CODIGO].apply(norm_code)
-    a['_fecha'] = pd.to_datetime(a[COL_ANC_FECHA], errors='coerce')
-    a['_cono']  = a[COL_ANC_CONO]
-    a['_ruta']  = a[COL_ANC_RUTA] if COL_ANC_RUTA < a.shape[1] else None
+    a['_cod']   = _col(a, COL_ANC_CODIGO).apply(norm_code)
+    a['_fecha'] = pd.to_datetime(_col(a, COL_ANC_FECHA), errors='coerce')
+    a['_cono']  = _col(a, COL_ANC_CONO)
+    a['_ruta']  = _col(a, COL_ANC_RUTA)
     a = a[a['_cod'] != '']
     a = a[(a['_fecha'] >= desde) & (a['_fecha'] <= hasta)]
     anc_counts = a.groupby('_cod').size().to_dict()
@@ -459,12 +528,14 @@ def build_funnel(pedidos_df: pd.DataFrame) -> dict:
 
 def build_conos(pedidos_df: pd.DataFrame) -> pd.DataFrame:
     """Resumen por cono: migración TMS + discrepancias de bultos."""
+    cols_vacias = ['cono','flota','total','migrados','sin_migrar','pct',
+                   'bultos_recibidos','bultos_anclados','dif_bultos','estado_anclaje_cono']
+    if pedidos_df.empty or 'flota' not in pedidos_df.columns:
+        return pd.DataFrame(columns=cols_vacias)
     vans = pedidos_df[pedidos_df['flota'] != 'OF MOTORIZADOS'].copy()
     vans = vans[vans['cono'].notna() & (vans['cono'].astype(str).str.strip() != '')]
     if vans.empty:
-        return pd.DataFrame(columns=[
-            'cono','flota','total','migrados','sin_migrar','pct',
-            'bultos_recibidos','bultos_anclados','dif_bultos','estado_anclaje_cono'])
+        return pd.DataFrame(columns=cols_vacias)
 
     rows = []
     for cono, grp in vans.groupby('cono'):
